@@ -9,3 +9,10 @@
 
 # build directory (from pulp's makefile)
 build/
+
+# GUI LVGL Library
+libraries/gui/libs/
+
+# GUI Build Directory
+libraries/gui/build
+libraries/gui/tests/build
