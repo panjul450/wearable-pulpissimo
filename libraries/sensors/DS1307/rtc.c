@@ -17,7 +17,7 @@ uint8_t bcd_to_dec(uint8_t val) {
 
 int rtc_init(i2c_dev_t *dev_conf, i2c_t **i2c_handle) {
     if (dev_conf == NULL || i2c_handle == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
     i2c_dev_init(dev_conf);
@@ -26,14 +26,14 @@ int rtc_init(i2c_dev_t *dev_conf, i2c_t **i2c_handle) {
 
     *i2c_handle = i2c_open(dev_conf);
     if (*i2c_handle == NULL) {
-        return -1;
+        return RTC_ERR_I2C_OPEN;
     }
-    return 0;
+    return RTC_OK;
 }
 
 int rtc_set_time(i2c_t *i2c_handle, rtc_time_t *time) {
     if (i2c_handle == NULL || time == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
     // Validasi range input sesuai datasheet DS1307
@@ -42,7 +42,7 @@ int rtc_set_time(i2c_t *i2c_handle, rtc_time_t *time) {
         time->date < 1 || time->date > 31 ||
         time->month < 1 || time->month > 12 ||
         time->year > 99) {
-        return -1;
+        return RTC_ERR_VALIDATION;
     }
 
     unsigned char tx_data[9];
@@ -71,14 +71,14 @@ int rtc_set_time(i2c_t *i2c_handle, rtc_time_t *time) {
 
     // Kirim data ke DS1307 lewat I2C 
     if (i2c_write(i2c_handle, tx_data, 9, 1) != 0) {
-        return -1;
+        return RTC_ERR_I2C_WRITE_SET;
     }
-    return 0;
+    return RTC_OK;
 }
 
 int rtc_get_time(i2c_t *i2c_handle, rtc_time_t *time) {
     if (i2c_handle == NULL || time == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
     unsigned char tx_data[2];
@@ -88,16 +88,16 @@ int rtc_get_time(i2c_t *i2c_handle, rtc_time_t *time) {
     tx_data[0] = DS1307_ADDR_WRITE; 
     tx_data[1] = DS1307_REG_SECONDS; 
     if (i2c_write(i2c_handle, tx_data, 2, 0) != 0) {
-        return -1;
+        return RTC_ERR_I2C_WRITE_PTR;
     }
 
     // Tahap 2: Lakukan burst read 7 byte dari register 0x00 hingga 0x06 (Seconds, Minutes, Hours, Day, Date, Month, Year)
     tx_data[0] = DS1307_ADDR_READ; 
     if (i2c_write(i2c_handle, tx_data, 1, 0) != 0) {
-        return -1;
+        return RTC_ERR_I2C_WRITE_READ;
     }
     if (i2c_read(i2c_handle, rx_data, 7, 0) != 0) {
-        return -1;
+        return RTC_ERR_I2C_READ;
     }
 
     // Tahap 3: Konversi hasil bacaan BCD ke Desimal
@@ -114,5 +114,5 @@ int rtc_get_time(i2c_t *i2c_handle, rtc_time_t *time) {
     time->month   = bcd_to_dec(rx_data[5]);
     time->year    = bcd_to_dec(rx_data[6]);
 
-    return 0;
+    return RTC_OK;
 }

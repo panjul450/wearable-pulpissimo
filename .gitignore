@@ -9,6 +9,7 @@
 
 # build directory (from pulp's makefile)
 build/
+
 libraries/sensors/DS1307/build/
-libraries/sensors/DS3231/test_host/
- 
+libraries/sensors/DS1307/test_host
+libraries/sensors/DS1307/build.sh
