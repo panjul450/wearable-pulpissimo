@@ -1,8 +1,10 @@
 #include "pulp.h"
 #include "rtc.h"
 
-#define DS1307_ADDR_WRITE  0xD0
-#define DS1307_ADDR_READ   0xD1
+// DS1307 I2C Address (8-bit format, sudah di-shift kiri)
+// Library i2c.c akan otomatis OR dengan bit R/W (0x1) saat read
+// Ref datasheet: 7-bit address = 0x68, 8-bit write = 0xD0, 8-bit read = 0xD1
+#define DS1307_ADDR        0xD0
 #define DS1307_REG_SECONDS 0x00 
 
 // Decimal to BCD
@@ -17,23 +19,24 @@ uint8_t bcd_to_dec(uint8_t val) {
 
 int rtc_init(i2c_dev_t *dev_conf, i2c_t **i2c_handle) {
     if (dev_conf == NULL || i2c_handle == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
     i2c_dev_init(dev_conf);
     dev_conf->id = 0; 
+    dev_conf->cs = DS1307_ADDR;     // FIX: Set chip-select ke address DS1307 (0xD0)
     dev_conf->max_baudrate = 100000; 
 
     *i2c_handle = i2c_open(dev_conf);
     if (*i2c_handle == NULL) {
-        return -1;
+        return RTC_ERR_I2C_OPEN;
     }
-    return 0;
+    return RTC_OK;
 }
 
 int rtc_set_time(i2c_t *i2c_handle, rtc_time_t *time) {
     if (i2c_handle == NULL || time == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
     // Validasi range input sesuai datasheet DS1307
@@ -42,62 +45,68 @@ int rtc_set_time(i2c_t *i2c_handle, rtc_time_t *time) {
         time->date < 1 || time->date > 31 ||
         time->month < 1 || time->month > 12 ||
         time->year > 99) {
-        return -1;
+        return RTC_ERR_VALIDATION;
     }
 
-    unsigned char tx_data[9];
+    // FIX: Buffer hanya berisi register pointer + 7 byte data (total 8 byte)
+    // Address TIDAK dimasukkan ke buffer — library i2c.c kirim address otomatis via dev->cs
+    unsigned char tx_data[8];
 
-    tx_data[0] = DS1307_ADDR_WRITE; 
-    tx_data[1] = DS1307_REG_SECONDS; 
+    tx_data[0] = DS1307_REG_SECONDS;  // Register pointer: mulai dari 0x00
 
     // REF DATASHEET: Register 00H (Seconds), Bit ke-7 adalah CH (Clock Halt).
     // Jika CH = 1, osilator mati. Jika CH = 0, osilator jalan.
     // Operator & 0x7F (01111111) digunakan untuk memaksa Bit-7 menjadi 0, 
     // sehingga jam dipastikan mulai berdetak setelah waktu diset.
-    tx_data[2] = dec_to_bcd(time->seconds) & 0x7F; 
+    tx_data[1] = dec_to_bcd(time->seconds) & 0x7F; 
     
-    tx_data[3] = dec_to_bcd(time->minutes);
+    tx_data[2] = dec_to_bcd(time->minutes);
     
     // REF DATASHEET: Register 02H (Hours), Bit ke-6 adalah flag 12/24 Mode.
     // 0 = Mode 24 jam, 1 = Mode 12 jam.
     // Operator & 0x3F (00111111) digunakan untuk memaksa Bit-6 dan Bit-7 menjadi 0, 
     // untuk memastikan sensor selalu dikunci pada format 24jam
-    tx_data[4] = dec_to_bcd(time->hours) & 0x3F;
+    tx_data[3] = dec_to_bcd(time->hours) & 0x3F;
     
-    tx_data[5] = dec_to_bcd(time->day);
-    tx_data[6] = dec_to_bcd(time->date);
-    tx_data[7] = dec_to_bcd(time->month);
-    tx_data[8] = dec_to_bcd(time->year);
+    tx_data[4] = dec_to_bcd(time->day);
+    tx_data[5] = dec_to_bcd(time->date);
+    tx_data[6] = dec_to_bcd(time->month);
+    tx_data[7] = dec_to_bcd(time->year);
 
-    // Kirim data ke DS1307 lewat I2C 
-    if (i2c_write(i2c_handle, tx_data, 9, 1) != 0) {
-        return -1;
+    // Kirim data ke DS1307 lewat I2C
+    // Library akan otomatis: [START][0xD0(cs)][tx_data[0..7]][STOP]
+    if (i2c_write(i2c_handle, tx_data, 8, 1) != 0) {
+        return RTC_ERR_I2C_WRITE_SET;
     }
-    return 0;
+    return RTC_OK;
 }
 
 int rtc_get_time(i2c_t *i2c_handle, rtc_time_t *time) {
     if (i2c_handle == NULL || time == NULL) {
-        return -1;
+        return RTC_ERR_NULL_PTR;
     }
 
-    unsigned char tx_data[2];
+    unsigned char tx_data[1];
     unsigned char rx_data[7];
 
-    // Tahap 1: Set pointer register ke 0x00 (Register Seconds) untuk memulai burst read
-    tx_data[0] = DS1307_ADDR_WRITE; 
-    tx_data[1] = DS1307_REG_SECONDS; 
-    if (i2c_write(i2c_handle, tx_data, 2, 0) != 0) {
-        return -1;
+    // Tahap 1: Set pointer register ke 0x00 (Register Seconds)
+    // Library akan otomatis: [START][0xD0(cs)][0x00]  (tanpa STOP → repeated start)
+    // FIX: Hanya kirim 1 byte (register pointer), BUKAN address + pointer
+    tx_data[0] = DS1307_REG_SECONDS; 
+    if (i2c_write(i2c_handle, tx_data, 1, 0) != 0) {
+        return RTC_ERR_I2C_WRITE_PTR;
     }
 
-    // Tahap 2: Lakukan burst read 7 byte dari register 0x00 hingga 0x06 (Seconds, Minutes, Hours, Day, Date, Month, Year)
-    tx_data[0] = DS1307_ADDR_READ; 
-    if (i2c_write(i2c_handle, tx_data, 1, 0) != 0) {
-        return -1;
-    }
-    if (i2c_read(i2c_handle, rx_data, 7, 0) != 0) {
-        return -1;
+    // Tahap 2: Burst read 7 byte dari register 0x00-0x06
+    // Library i2c_read() akan otomatis: [START][0xD0|0x1=0xD1][RD_ACK x6][RD_NACK][STOP]
+    //
+    // FIX: i2c_read() return value convention:
+    //   - Sukses  = return jumlah byte yang dibaca (7)
+    //   - Timeout = return 0
+    // Parameter ke-4 'pending': 0 = kirim STOP setelah read (transaksi selesai)
+    int bytes_read = i2c_read(i2c_handle, rx_data, 7, 0);
+    if (bytes_read != 7) {
+        return RTC_ERR_I2C_READ;
     }
 
     // Tahap 3: Konversi hasil bacaan BCD ke Desimal
@@ -114,5 +123,5 @@ int rtc_get_time(i2c_t *i2c_handle, rtc_time_t *time) {
     time->month   = bcd_to_dec(rx_data[5]);
     time->year    = bcd_to_dec(rx_data[6]);
 
-    return 0;
+    return RTC_OK;
 }

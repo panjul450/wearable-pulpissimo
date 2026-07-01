@@ -97,14 +97,12 @@ if command -v "$RISCV_GCC" &>/dev/null; then
     echo "      Binary: $GCC_PATH"
     echo "      Directory: $TOOLCHAIN_BIN"
 else
-    # Calculate the expected fallback path for the instruction text
-    EXPECTED_BIN_DIR="$SCRIPT_DIR/chroot/bin"
 
     echo "  ERROR: $RISCV_GCC not found in your PATH."
     echo "  Please add the chroot toolchain to your environment variables."
     echo ""
     echo "  To fix this for your current terminal session, run:"
-    echo "    export PATH=\"\$PATH:$EXPECTED_BIN_DIR\""
+    echo "    export PATH=\"\$PATH:<absolute_path_to_chroot>/bin\""
     echo ""
     echo "  To make this permanent, add that line to your ~/.bashrc or ~/.zshrc"
 
@@ -132,7 +130,7 @@ else
     echo "  ERROR: PULPRT_HOME environment variable is not set."
     echo "         You need to activate the pulpissimo configuration first."
     echo ""
-    echo "  Please run your mentor's configuration commands:"
+    echo "  Please run this configuration commands:"
     echo "    . <path_to_pulp-runtime>/configs/pulpissimo.sh"
     echo "    . <path_to_pulp-runtime>/configs/fpgas/pulpissimo/genesys2.sh"
 
