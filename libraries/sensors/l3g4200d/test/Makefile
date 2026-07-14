@@ -16,7 +16,7 @@
 SENSOR      = l3g4200d
 PULP_APP    = test_l3g4200d
 PULP_LDFLAGS += -Wl,--start-group -lc -Wl,--end-group
-PULP_APP_C_SRCS = test_l3g4200d.c
+PULP_APP_C_SRCS = test_l3g4200d.c ../l3g4200d.c
 # Compiler flags
 PULP_CFLAGS = -O3 -g -I..
 # Include pulp-runtime build rules

@@ -1,374 +1,351 @@
-#include <stdint.h>
+/*
+ * Copyright (C) 2026 ICDeC
+ *
+ * Driver library minimal untuk STMicroelectronics L3G4200D 3-Axis Gyroscope.
+ * Lihat l3g4200d.h untuk dokumentasi API dan catatan penting.
+ *
+ * Implementasi ini adalah hasil reverse-engineering dari raw I2C test
+ * (test_l3g4200d.c versi "Raw I2C Test") yang sudah TERBUKTI berhasil:
+ *   - TEST 0-5: 6 PASSED, 0 FAILED
+ *   - Continuous read: 100 sampel terbaca dengan nilai wajar
+ *
+ * Dua hal kunci yang membuat versi sebelumnya (l3g4200d_init() lama)
+ * gagal/hang, dan sudah diperbaiki di sini:
+ *   1. Delay kecil (~200 loop iterasi) antara fase write-alamat-register
+ *      dan fase read-data. Tanpa ini, hasil baca selalu 0xFF meski
+ *      tidak ada error/timeout yang terdeteksi oleh i2c_write()/i2c_read().
+ *   2. Konversi ke deg/s pakai integer fixed-point (x100), BUKAN float --
+ *      PULPissimo tidak punya FPU, dan float terbukti menghasilkan nilai
+ *      yang salah.
+ */
+
+#include <stdio.h>
 #include <string.h>
 #include "pulp.h"
 #include "l3g4200d.h"
 
-//Internal driver state
-static struct {
-    i2c_t          *i2c;           
-    i2c_dev_t       i2c_dev;      
-    uint8_t         i2c_addr;      
-    l3g4200d_range_t range;        
-    float           sensitivity;   
-    int             initialized;  
-} l3g4200d_state = { .initialized = 0 };
+/* ============================================================================
+ * Konfigurasi Internal
+ * ============================================================================ */
 
-//Sensitivity Lookup
-static float l3g4200d_get_sensitivity(l3g4200d_range_t range)
+/** Software timeout untuk tiap transaksi I2C (microseconds).
+ *  Ini memakai mekanisme timeout BAWAAN i2c.c (pos_tick_get_counter_us()),
+ *  bukan guard timer terpisah. */
+#define L3G4200D_I2C_TIMEOUT_US   5000
+
+/** Delay antara fase write-alamat-register dan fase read-data.
+ *  Terbukti WAJIB ada -- tanpa ini hasil baca selalu 0xFF. */
+#define L3G4200D_READ_DELAY_LOOPS 200
+
+/** Delay setelah menulis register konfigurasi, sebelum verifikasi readback. */
+#define L3G4200D_CONFIG_SETTLE_LOOPS 50000
+
+/* ============================================================================
+ * Sensitivity Lookup (fixed-point, mdps/digit * 100)
+ *   250dps  -> 8.75  mdps/digit -> num=875,  denom=1000
+ *   500dps  -> 17.50 mdps/digit -> num=1750, denom=1000
+ *   2000dps -> 70.00 mdps/digit -> num=7000, denom=1000
+ * ============================================================================ */
+
+typedef struct {
+    int32_t num;
+    int32_t denom;
+} l3g4200d_sens_t;
+
+static l3g4200d_sens_t l3g4200d_get_sensitivity(l3g4200d_range_t range)
 {
+    l3g4200d_sens_t s;
     switch (range) {
-        case L3G4200D_RANGE_250DPS:   return 8.75f;
-        case L3G4200D_RANGE_500DPS:   return 17.50f;
-        case L3G4200D_RANGE_2000DPS:  return 70.00f;
-        default:                      return 8.75f;
+        case L3G4200D_RANGE_500DPS:
+            s.num = 1750; s.denom = 1000;
+            break;
+        case L3G4200D_RANGE_2000DPS:
+            s.num = 7000; s.denom = 1000;
+            break;
+        case L3G4200D_RANGE_250DPS:
+        default:
+            s.num = 875; s.denom = 1000;
+            break;
     }
+    return s;
 }
 
-//Low-Level I2C Helpers (with timeout + retry)
+/* ============================================================================
+ * Internal Driver State
+ * ============================================================================ */
 
-/**
- * @brief Write a single byte to a register on the L3G4200D.
- *
- * Includes retry mechanism with timeout detection to prevent
- * infinite blocking when the sensor does not respond.
- *
- * @param reg   Register address.
- * @param value Byte value to write.
- * @return GYRO_OK on success, GYRO_ERR_TIMEOUT after all retries exhausted.
- */
-static gyro_status_t l3g4200d_write_reg(uint8_t reg, uint8_t value)
+static struct {
+    i2c_t            *i2c;
+    i2c_dev_t         i2c_dev;
+    uint8_t           i2c_addr_7bit;
+    l3g4200d_range_t  range;
+    l3g4200d_sens_t   sensitivity;
+    int               initialized;
+} l3g_state = { .initialized = 0 };
+
+/* ============================================================================
+ * Low-Level I2C Helpers (raw i2c_write()/i2c_read(), TERBUKTI berhasil)
+ * ============================================================================ */
+
+static int l3g_write_reg(uint8_t reg, uint8_t value)
 {
     unsigned char data[2];
     data[0] = reg;
     data[1] = value;
-
-    for (int retry = 0; retry < GYRO_I2C_MAX_RETRIES; retry++) {
-        int ret = i2c_write(l3g4200d_state.i2c, data, 2, 1);
-
-        /* Check if I2C hardware timeout occurred */
-        if (i2c_managetimeoutflag(true)) {
-            printf("[L3G4200D] I2C write timeout (reg=0x%02X, retry=%d/%d)\n",
-                   reg, retry + 1, GYRO_I2C_MAX_RETRIES);
-            continue;
-        }
-
-        if (ret == 0) {
-            return GYRO_OK;
-        }
-
-        printf("[L3G4200D] I2C write error (reg=0x%02X, ret=%d, retry=%d/%d)\n",
-               reg, ret, retry + 1, GYRO_I2C_MAX_RETRIES);
-    }
-
-    return GYRO_ERR_TIMEOUT;
+    return i2c_write(l3g_state.i2c, data, 2, 1); /* send_stop = 1 */
 }
 
 /**
- * @brief Read one or more bytes from a register on the L3G4200D.
- *
- * Includes retry mechanism with timeout detection. For multi-byte
- * reads, sets the MSB of the register address to enable auto-increment
- * (L3G4200D datasheet requirement).
- *
- * @param reg    Starting register address.
- * @param buffer Pointer to buffer for received data.
- * @param len    Number of bytes to read.
- * @return GYRO_OK on success, GYRO_ERR_TIMEOUT after all retries exhausted.
+ * Baca 1 byte dari 1 register. Memakai repeated-start + delay kecil
+ * (L3G4200D_READ_DELAY_LOOPS) -- kombinasi yang terbukti berhasil di
+ * pengujian raw I2C sebelumnya.
  */
-static gyro_status_t l3g4200d_read_reg(uint8_t reg, uint8_t *buffer, int len)
+static int l3g_read_reg(uint8_t reg, uint8_t *out)
 {
-    unsigned char reg_addr;
+    unsigned char r = reg;
 
-    /*
-     * For multi-byte reads, set the MSB of the register address
-     * to enable auto-increment (L3G4200D datasheet requirement).
-     */
-    if (len > 1) {
-        reg_addr = reg | L3G4200D_AUTO_INCREMENT_ADDR;
-    } else {
-        reg_addr = reg;
+    int ret = i2c_write(l3g_state.i2c, &r, 1, 0); /* tanpa stop -> repeated start */
+    if (ret != 0) {
+        return -1;
     }
 
-    for (int retry = 0; retry < GYRO_I2C_MAX_RETRIES; retry++) {
-        /* Write register address (no STOP, so the sensor keeps the bus) */
-        int ret = i2c_write(l3g4200d_state.i2c, &reg_addr, 1, 0);
+    for (volatile int d = 0; d < L3G4200D_READ_DELAY_LOOPS; d++);
 
-        if (i2c_managetimeoutflag(true)) {
-            printf("[L3G4200D] I2C addr write timeout (reg=0x%02X, retry=%d/%d)\n",
-                   reg, retry + 1, GYRO_I2C_MAX_RETRIES);
-            continue;
-        }
-
-        if (ret != 0) {
-            printf("[L3G4200D] I2C addr write error (reg=0x%02X, ret=%d, retry=%d/%d)\n",
-                   reg, ret, retry + 1, GYRO_I2C_MAX_RETRIES);
-            continue;
-        }
-
-        /* Read data bytes */
-        ret = i2c_read(l3g4200d_state.i2c, buffer, len, 0);
-
-        if (i2c_managetimeoutflag(true)) {
-            printf("[L3G4200D] I2C read timeout (reg=0x%02X, retry=%d/%d)\n",
-                   reg, retry + 1, GYRO_I2C_MAX_RETRIES);
-            continue;
-        }
-
-        /* Success */
-        return GYRO_OK;
+    int n = i2c_read(l3g_state.i2c, out, 1, 0);
+    if (n != 1) {
+        return -2;
     }
 
-    return GYRO_ERR_TIMEOUT;
+    return 0;
 }
 
-//Public API Implementation
+/**
+ * Baca banyak byte sekaligus dengan auto-increment (WAJIB set bit 0x80
+ * pada alamat register awal).
+ * @return jumlah byte yang berhasil dibaca, -1 kalau fase write gagal.
+ */
+static int l3g_read_bytes_auto_increment(uint8_t startReg, uint8_t *buf, int len)
+{
+    unsigned char r = startReg | L3G4200D_AUTO_INCREMENT_BIT;
 
-gyro_status_t l3g4200d_default_config(l3g4200d_config_t *cfg)
+    int ret = i2c_write(l3g_state.i2c, &r, 1, 0);
+    if (ret != 0) {
+        return -1;
+    }
+
+    for (volatile int d = 0; d < L3G4200D_READ_DELAY_LOOPS; d++);
+
+    return i2c_read(l3g_state.i2c, buf, len, 0);
+}
+
+/* ============================================================================
+ * Internal: buka I2C bus untuk satu alamat tertentu, lalu cek WHO_AM_I.
+ * ============================================================================ */
+
+static l3g4200d_status_t l3g_try_open_and_verify(uint8_t addr_7bit, int i2c_id, unsigned int freq)
+{
+    i2c_dev_init(&l3g_state.i2c_dev);
+    l3g_state.i2c_dev.id           = i2c_id;
+    l3g_state.i2c_dev.cs           = (addr_7bit << 1); /* format 8-bit untuk i2c_dev_t.cs */
+    l3g_state.i2c_dev.max_baudrate = freq;
+
+    l3g_state.i2c = i2c_open(&l3g_state.i2c_dev);
+    if (l3g_state.i2c == NULL) {
+        return L3G4200D_ERR_I2C;
+    }
+
+    i2c_settimeout(L3G4200D_I2C_TIMEOUT_US, 1);
+
+    uint8_t who_am_i = 0;
+    int ret = l3g_read_reg(L3G4200D_REG_WHO_AM_I, &who_am_i);
+    if (ret != 0) {
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_TIMEOUT;
+    }
+
+    if (who_am_i != L3G4200D_WHO_AM_I_VALUE) {
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_ID;
+    }
+
+    l3g_state.i2c_addr_7bit = addr_7bit;
+    return L3G4200D_OK;
+}
+
+/* ============================================================================
+ * Public API Implementation
+ * ============================================================================ */
+
+l3g4200d_status_t l3g4200d_default_config(l3g4200d_config_t *cfg)
 {
     if (cfg == NULL) {
-        return GYRO_ERR_NULL;
+        return L3G4200D_ERR_NULL;
     }
 
     cfg->i2c_addr = L3G4200D_I2C_ADDR_DEFAULT;
-    cfg->i2c_id   = GYRO_DEFAULT_I2C_ID;
-    cfg->i2c_freq = GYRO_DEFAULT_I2C_BAUDRATE;
+    cfg->i2c_id   = 0;
+    cfg->i2c_freq = 100000;
     cfg->range    = L3G4200D_RANGE_250DPS;
 
-    return GYRO_OK;
+    return L3G4200D_OK;
 }
 
-gyro_status_t l3g4200d_init(const l3g4200d_config_t *cfg)
+l3g4200d_status_t l3g4200d_init(l3g4200d_config_t *cfg)
 {
-    gyro_status_t status;
-    uint8_t       who_am_i;
-    uint8_t       read_val;
-
     if (cfg == NULL) {
-        return GYRO_ERR_NULL;
+        return L3G4200D_ERR_NULL;
     }
 
-    printf("\n--- Test: Initialization ---\n");
-    printf("[INIT] Opening I2C...\n");
+    printf("[L3G4200D] Membuka I2C, mencoba addr=0x%02X...\n", cfg->i2c_addr);
+    l3g4200d_status_t status = l3g_try_open_and_verify(cfg->i2c_addr, cfg->i2c_id, cfg->i2c_freq);
 
-    /* Configure I2C device */
-    i2c_dev_init(&l3g4200d_state.i2c_dev);
-    l3g4200d_state.i2c_dev.id           = cfg->i2c_id;
-    /* 
-     * pulp-runtime i2c.c expects the 8-bit base address in dev->cs.
-     * It uses dev->cs directly for write and (dev->cs | 0x1) for read.
-     * Thus, we must shift the 7-bit address left by 1.
-     */
-    l3g4200d_state.i2c_dev.cs           = (cfg->i2c_addr << 1); 
-    l3g4200d_state.i2c_dev.max_baudrate = cfg->i2c_freq;
+    if (status != L3G4200D_OK) {
+        uint8_t alt_addr = (cfg->i2c_addr == L3G4200D_I2C_ADDR_DEFAULT)
+                                ? L3G4200D_I2C_ADDR_ALT
+                                : L3G4200D_I2C_ADDR_DEFAULT;
 
-    printf("I2C Port : %d\n", l3g4200d_state.i2c_dev.id);
-    printf("Address  : 0x%02X\n", (uint8_t)l3g4200d_state.i2c_dev.cs);
-    printf("Baudrate : %d\n", l3g4200d_state.i2c_dev.max_baudrate);
+        printf("[L3G4200D] addr=0x%02X gagal (err=%d), mencoba addr=0x%02X...\n",
+               cfg->i2c_addr, status, alt_addr);
 
-    /* Open I2C bus */
-    l3g4200d_state.i2c = i2c_open(&l3g4200d_state.i2c_dev);
-    if (l3g4200d_state.i2c == NULL) {
-        printf("FAIL\n");
-        return GYRO_ERR_I2C;
-    }
-    printf("OK\n\n");
-
-    printf("OK bang1\n\n");
-    /* Set I2C timeout */
-    i2c_settimeout(GYRO_I2C_TIMEOUT_US, 1);
-
-    printf("OK bang\n\n");
-
-    /* Store configuration */
-    printf("sebelumnya");
-    l3g4200d_state.i2c_addr   = cfg->i2c_addr;
-    l3g4200d_state.range      = cfg->range;
-    l3g4200d_state.sensitivity = l3g4200d_get_sensitivity(cfg->range);
-    printf("disini");
-
-    printf("[INIT] Waiting for sensor boot...\n");
-    for (volatile int i = 0; i < GYRO_BOOT_DELAY_CYCLES; i++);
-    printf("OK\n\n");
-
-    /* Verify WHO_AM_I */
-    printf("[INIT] Reading Part ID...\n");
-    printf("[READ] Reg 0x%02X\n", L3G4200D_REG_WHO_AM_I);
-    status = l3g4200d_read_reg(L3G4200D_REG_WHO_AM_I, &who_am_i, 1);
-    if (status != GYRO_OK) {
-        printf("FAIL: I2C Read Error (err=%d)\n", status);
-        i2c_close(l3g4200d_state.i2c);
-        return status;
-    }
-    printf("[READ] Value = 0x%02X\n", who_am_i);
-    
-    if (who_am_i != L3G4200D_WHO_AM_I_VALUE) {
-        printf("FAIL: Mismatch (expected 0x%02X)\n", L3G4200D_WHO_AM_I_VALUE);
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_ID;
-    }
-    printf("OK\n\n");
-
-    /* Configure CTRL_REG1 */
-    uint8_t ctrl_reg1_val = L3G4200D_ODR_100HZ_BW12P5 | L3G4200D_NORMAL_MODE | L3G4200D_ALL_AXES_ENABLE;
-    printf("[INIT] Configuring CTRL_REG1...\n");
-    printf("[WRITE] Reg 0x%02X <- 0x%02X\n", L3G4200D_REG_CTRL_REG1, ctrl_reg1_val);
-    status = l3g4200d_write_reg(L3G4200D_REG_CTRL_REG1, ctrl_reg1_val);
-    if (status != GYRO_OK) {
-        printf("FAIL: Write Error\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
+        status = l3g_try_open_and_verify(alt_addr, cfg->i2c_id, cfg->i2c_freq);
+        if (status != L3G4200D_OK) {
+            printf("[L3G4200D] Kedua alamat gagal (err=%d)\n", status);
+            return status;
+        }
+        cfg->i2c_addr = alt_addr;
     }
 
-    /* Read back to verify */
-    printf("[READ] Reg 0x%02X\n", L3G4200D_REG_CTRL_REG1);
-    status = l3g4200d_read_reg(L3G4200D_REG_CTRL_REG1, &read_val, 1);
-    if (status != GYRO_OK) {
-        printf("FAIL: Read Error\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
-    }
-    printf("[READ] Value = 0x%02X\n", read_val);
-    if (read_val != ctrl_reg1_val) {
-        printf("FAIL: Verification mismatch\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
-    }
-    printf("OK\n\n");
+    printf("[L3G4200D] WHO_AM_I OK di addr=0x%02X\n", cfg->i2c_addr);
 
-    /* Configure CTRL_REG4 */
-    uint8_t ctrl_reg4_val = L3G4200D_BDU_BLOCKED | cfg->range;
-    printf("[INIT] Configuring CTRL_REG4...\n");
-    printf("[WRITE] Reg 0x%02X <- 0x%02X\n", L3G4200D_REG_CTRL_REG4, ctrl_reg4_val);
-    status = l3g4200d_write_reg(L3G4200D_REG_CTRL_REG4, ctrl_reg4_val);
-    if (status != GYRO_OK) {
-        printf("FAIL: Write Error\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
+    /* Konfigurasi CTRL_REG1: power up + enable X,Y,Z, ODR=100Hz */
+    int wret = l3g_write_reg(L3G4200D_REG_CTRL_REG1, L3G4200D_CTRL_REG1_NORMAL_XYZ_100HZ);
+    if (wret != 0) {
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_CONFIG;
+    }
+    for (volatile int i = 0; i < L3G4200D_CONFIG_SETTLE_LOOPS; i++);
+
+    uint8_t ctrl1_readback = 0;
+    if (l3g_read_reg(L3G4200D_REG_CTRL_REG1, &ctrl1_readback) != 0 ||
+        ctrl1_readback != L3G4200D_CTRL_REG1_NORMAL_XYZ_100HZ) {
+        printf("[L3G4200D] Verifikasi CTRL_REG1 gagal (readback=0x%02X)\n", ctrl1_readback);
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_CONFIG;
     }
 
-    /* Read back to verify */
-    printf("[READ] Reg 0x%02X\n", L3G4200D_REG_CTRL_REG4);
-    status = l3g4200d_read_reg(L3G4200D_REG_CTRL_REG4, &read_val, 1);
-    if (status != GYRO_OK) {
-        printf("FAIL: Read Error\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
+    /* Konfigurasi CTRL_REG4: full-scale range */
+    wret = l3g_write_reg(L3G4200D_REG_CTRL_REG4, (uint8_t)cfg->range);
+    if (wret != 0) {
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_CONFIG;
     }
-    printf("[READ] Value = 0x%02X\n", read_val);
-    if (read_val != ctrl_reg4_val) {
-        printf("FAIL: Verification mismatch\n");
-        i2c_close(l3g4200d_state.i2c);
-        return GYRO_ERR_CONFIG;
+    for (volatile int i = 0; i < L3G4200D_CONFIG_SETTLE_LOOPS; i++);
+
+    uint8_t ctrl4_readback = 0xFF;
+    if (l3g_read_reg(L3G4200D_REG_CTRL_REG4, &ctrl4_readback) != 0 ||
+        ctrl4_readback != (uint8_t)cfg->range) {
+        printf("[L3G4200D] Verifikasi CTRL_REG4 gagal (readback=0x%02X)\n", ctrl4_readback);
+        i2c_close(l3g_state.i2c);
+        return L3G4200D_ERR_CONFIG;
     }
-    printf("OK\n\n");
 
-    l3g4200d_state.initialized = 1;
-    printf("[PASS] l3g4200d_init returns OK\n");
+    l3g_state.range       = cfg->range;
+    l3g_state.sensitivity = l3g4200d_get_sensitivity(cfg->range);
+    l3g_state.initialized = 1;
 
-    return GYRO_OK;
+    printf("[L3G4200D] Init selesai: addr=0x%02X, range=%d\n", cfg->i2c_addr, cfg->range);
+
+    return L3G4200D_OK;
 }
 
-gyro_status_t l3g4200d_who_am_i(uint8_t *id)
+l3g4200d_status_t l3g4200d_who_am_i(uint8_t *id)
 {
     if (id == NULL) {
-        return GYRO_ERR_NULL;
+        return L3G4200D_ERR_NULL;
     }
-    if (!l3g4200d_state.initialized) {
-        return GYRO_ERR_CONFIG;
+    if (!l3g_state.initialized) {
+        return L3G4200D_ERR_CONFIG;
     }
 
-    return l3g4200d_read_reg(L3G4200D_REG_WHO_AM_I, id, 1);
+    int ret = l3g_read_reg(L3G4200D_REG_WHO_AM_I, id);
+    return (ret == 0) ? L3G4200D_OK : L3G4200D_ERR_TIMEOUT;
 }
 
-gyro_status_t l3g4200d_read_raw(gyro_raw_t *raw)
+l3g4200d_status_t l3g4200d_read_raw(l3g4200d_raw_t *raw)
 {
-    uint8_t buffer[6];
-    gyro_status_t status;
-
     if (raw == NULL) {
-        return GYRO_ERR_NULL;
+        return L3G4200D_ERR_NULL;
     }
-    if (!l3g4200d_state.initialized) {
-        return GYRO_ERR_CONFIG;
-    }
-
-    /* Read 6 bytes starting from OUT_X_L with auto-increment */
-    status = l3g4200d_read_reg(L3G4200D_REG_OUT_X_L, buffer, 6);
-    if (status != GYRO_OK) {
-        return status;
+    if (!l3g_state.initialized) {
+        return L3G4200D_ERR_CONFIG;
     }
 
-    /* L3G4200D stores data in little-endian (low byte first) */
-    raw->x = (int16_t)((buffer[1] << 8) | buffer[0]);
-    raw->y = (int16_t)((buffer[3] << 8) | buffer[2]);
-    raw->z = (int16_t)((buffer[5] << 8) | buffer[4]);
+    uint8_t buf[6] = {0};
+    int received = l3g_read_bytes_auto_increment(L3G4200D_REG_OUT_X_L, buf, 6);
+    if (received != 6) {
+        return L3G4200D_ERR_TIMEOUT;
+    }
 
-    return GYRO_OK;
+    /* L3G4200D: little-endian (byte Low duluan, baru High) */
+    raw->x = (int16_t)((buf[1] << 8) | buf[0]);
+    raw->y = (int16_t)((buf[3] << 8) | buf[2]);
+    raw->z = (int16_t)((buf[5] << 8) | buf[4]);
+
+    return L3G4200D_OK;
 }
 
-gyro_status_t l3g4200d_read_dps(gyro_dps_t *dps)
+l3g4200d_status_t l3g4200d_read_dps_x100(l3g4200d_dps_x100_t *dps)
 {
-    gyro_raw_t raw;
-    gyro_status_t status;
-
     if (dps == NULL) {
-        return GYRO_ERR_NULL;
+        return L3G4200D_ERR_NULL;
     }
 
-    status = l3g4200d_read_raw(&raw);
-    if (status != GYRO_OK) {
+    l3g4200d_raw_t raw;
+    l3g4200d_status_t status = l3g4200d_read_raw(&raw);
+    if (status != L3G4200D_OK) {
         return status;
     }
 
-    /* Convert raw data to degrees per second.
-     * Sensitivity is in mdps/digit, so divide by 1000 to get dps. */
-    dps->x = (float)raw.x * l3g4200d_state.sensitivity / 1000.0f;
-    dps->y = (float)raw.y * l3g4200d_state.sensitivity / 1000.0f;
-    dps->z = (float)raw.z * l3g4200d_state.sensitivity / 1000.0f;
+    /* Integer fixed-point, TIDAK pakai float (PULPissimo tidak punya FPU) */
+    dps->x_x100 = ((int32_t)raw.x * l3g_state.sensitivity.num) / l3g_state.sensitivity.denom;
+    dps->y_x100 = ((int32_t)raw.y * l3g_state.sensitivity.num) / l3g_state.sensitivity.denom;
+    dps->z_x100 = ((int32_t)raw.z * l3g_state.sensitivity.num) / l3g_state.sensitivity.denom;
 
-    return GYRO_OK;
+    return L3G4200D_OK;
 }
 
-gyro_status_t l3g4200d_set_range(l3g4200d_range_t range)
+l3g4200d_status_t l3g4200d_set_range(l3g4200d_range_t range)
 {
-    gyro_status_t status;
-
-    if (!l3g4200d_state.initialized) {
-        return GYRO_ERR_CONFIG;
+    if (!l3g_state.initialized) {
+        return L3G4200D_ERR_CONFIG;
     }
 
-    /* Write new range to CTRL_REG4 (keep BDU=1) */
-    status = l3g4200d_write_reg(L3G4200D_REG_CTRL_REG4,
-                                L3G4200D_BDU_BLOCKED | range);
-    if (status != GYRO_OK) {
-        return GYRO_ERR_I2C;
+    int wret = l3g_write_reg(L3G4200D_REG_CTRL_REG4, (uint8_t)range);
+    if (wret != 0) {
+        return L3G4200D_ERR_I2C;
     }
+    for (volatile int i = 0; i < L3G4200D_CONFIG_SETTLE_LOOPS; i++);
 
-    l3g4200d_state.range       = range;
-    l3g4200d_state.sensitivity = l3g4200d_get_sensitivity(range);
+    l3g_state.range       = range;
+    l3g_state.sensitivity = l3g4200d_get_sensitivity(range);
 
-    return GYRO_OK;
+    return L3G4200D_OK;
 }
 
-gyro_status_t l3g4200d_deinit(void)
+l3g4200d_status_t l3g4200d_deinit(void)
 {
-    if (!l3g4200d_state.initialized) {
-        return GYRO_OK;
+    if (!l3g_state.initialized) {
+        return L3G4200D_OK;
     }
 
-    /*
-     * Power down the sensor:
-     * Set CTRL_REG1 PD bit to 0 (power-down mode), disable all axes.
-     */
-    l3g4200d_write_reg(L3G4200D_REG_CTRL_REG1, L3G4200D_POWER_DOWN);
+    l3g_write_reg(L3G4200D_REG_CTRL_REG1, L3G4200D_CTRL_REG1_POWER_DOWN);
 
-    /* Close I2C */
-    if (l3g4200d_state.i2c != NULL) {
-        i2c_close(l3g4200d_state.i2c);
-        l3g4200d_state.i2c = NULL;
+    if (l3g_state.i2c != NULL) {
+        i2c_close(l3g_state.i2c);
+        l3g_state.i2c = NULL;
     }
 
-    l3g4200d_state.initialized = 0;
+    l3g_state.initialized = 0;
 
-    return GYRO_OK;
+    return L3G4200D_OK;
 }
