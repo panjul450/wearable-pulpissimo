@@ -16,6 +16,7 @@
 
 SENSOR      = mpu6050
 PULP_APP    = test_mpu6050
+PULP_LDFLAGS += -Wl,--start-group -lc -Wl,--end-group
 PULP_APP_C_SRCS = test_mpu6050.c ../mpu6050.c
 
 # Compiler flags

@@ -95,15 +95,25 @@ typedef enum {
 #define GYRO_DEFAULT_I2C_ID       0          /**< Default I2C peripheral ID */
 #define GYRO_DEFAULT_I2C_BAUDRATE 100000     /**< Default I2C baudrate (100kHz standard mode) */
 
-/** L3G4200D default I2C slave address (SDO pin LOW) — 7-bit address */
-#define L3G4200D_I2C_ADDR_DEFAULT 0x68
-/** L3G4200D alternative I2C slave address (SDO pin HIGH) — 7-bit address */
-#define L3G4200D_I2C_ADDR_ALT     0x69
+/** L3G4200D default I2C slave address (SDO pin HIGH) — 7-bit address */
+#define L3G4200D_I2C_ADDR_DEFAULT 0x69
+/** L3G4200D alternative I2C slave address (SDO pin LOW) — 7-bit address */
+#define L3G4200D_I2C_ADDR_ALT     0x68
 
-/** MPU-6050 default I2C slave address (AD0 pin LOW) — 7-bit address */
-#define MPU6050_I2C_ADDR_DEFAULT  0x68
-/** MPU-6050 alternative I2C slave address (AD0 pin HIGH) — 7-bit address */
-#define MPU6050_I2C_ADDR_ALT      0x69
+/** MPU-6050 default I2C slave address (AD0 pin HIGH) — 7-bit address */
+#define MPU6050_I2C_ADDR_DEFAULT  0x69
+/** MPU-6050 alternative I2C slave address (AD0 pin LOW) — 7-bit address */
+#define MPU6050_I2C_ADDR_ALT      0x68
+
+/* ============================================================================
+ * Timeout / Retry Configuration
+ * ============================================================================ */
+
+#define GYRO_I2C_TIMEOUT_US       5000    /**< I2C hardware timeout (microseconds) */
+#define GYRO_I2C_MAX_RETRIES      3       /**< Max retries per I2C operation */
+#define GYRO_BOOT_DELAY_CYCLES    50000   /**< Software delay for sensor boot (~5-10ms) */
+#define GYRO_RESET_DELAY_CYCLES   100000  /**< Software delay for device reset (~100ms) */
+#define GYRO_WAKEUP_DELAY_CYCLES  50000   /**< Software delay for wake-up stabilization */
 
 #ifdef __cplusplus
 }
