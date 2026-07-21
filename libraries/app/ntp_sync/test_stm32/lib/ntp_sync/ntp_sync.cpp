@@ -37,12 +37,13 @@ static int ntp_eth_connect(void)
 {
     Serial.println("[NTP] Initializing W5500 Ethernet...");
 
-    // Initialize Ethernet with DHCP (Auto IP)
+    // Initialize Ethernet with DHCP (Auto IP), timeout 10 detik
     Ethernet.init(W5500_CS_PIN);
-    Serial.println("[NTP] Meminta IP Address dari DHCP Router...");
+    Serial.println("[NTP] Meminta IP Address dari DHCP Router... (max 10 detik)");
     
-    if (Ethernet.begin(mac) == 0) {
-        Serial.println("[NTP WARN] DHCP Gagal! Menggunakan IP statis...");
+    if (Ethernet.begin(mac, 10000, 4000) == 0) {
+        Serial.println("[NTP WARN] DHCP Gagal! Kabel LAN belum dicolok atau router tidak merespon.");
+        Serial.println("[NTP WARN] Menggunakan IP statis sebagai fallback...");
         Ethernet.begin(mac, BOARD_IP, IPAddress(8, 8, 8, 8), BOARD_GATEWAY, BOARD_SUBNET);
     }
 
