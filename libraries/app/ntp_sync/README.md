@@ -103,7 +103,7 @@ Tugas tim selanjutnya hanyalah mengisi bagian `#else` di Fungsi 1 dan 2 dengan l
 
 ## ⚡ Versi STM32 (Sudah Berjalan di Hardware)
 
-> **PENTING:** Karena jalur SPI di board PULPissimo masih ada bug hardware (bus contention pada MISO), modul ini sudah di-porting dan **berhasil dijalankan di STM32 Nucleo F401RE** sebagai solusi sementara. Semua source code STM32 ada di folder `test_stm32/`.
+> **PENTING:** Karena jalur SPI di board PULPissimo masih ada bug, modul ini sudah di-porting dan **berhasil dijalankan di STM32 Nucleo F401RE** sebagai solusi sementara. Semua source code STM32 ada di folder `test_stm32/`.
 
 ### Cara Menjalankan Versi STM32
 
